@@ -7,7 +7,7 @@
     "width": 1280,
     "height": 960
   },
-  "model_id": "indoor:depth_anything_v2_metric_hypersim_vits.pth",
+  "model_id": "indoor:depth_anything_v2_metric_hypersim_vits.pth:input252",
   "samples": [
     {
       "pixel": [

@@ -182,15 +182,15 @@ class VideoSource:
 
     def close(self) -> None:
         self._stop_reader.set()
-        if self.capture is not None:
-            self.capture.release()
-            self.capture = None
         with self._frame_condition:
             self._latest_frame = None
             self._latest_observed = None
             self._frame_condition.notify_all()
         if self._reader_thread is not None and self._reader_thread is not threading.current_thread():
             self._reader_thread.join(timeout=1.0)
+        if self.capture is not None:
+            self.capture.release()
+            self.capture = None
 
 
 class DepthEstimator:

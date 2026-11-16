@@ -289,6 +289,77 @@ def atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
             temporary.unlink(missing_ok=True)
 
 
+class LazyViewDict(dict):
+    """Dictionary that lazily renders and encodes camera and depth views on demand."""
+    def __init__(self, raw_frame: np.ndarray, display_frame: np.ndarray,
+                 depth_map: np.ndarray | None, detections: list[dict[str, Any]],
+                 min_depth_m: float, max_depth_m: float, depth_stale: bool,
+                 quality: int = 85):
+        super().__init__()
+        self._raw = raw_frame
+        self._ai = display_frame
+        self._depth_map = depth_map
+        self._detections = detections
+        self._min_depth_m = min_depth_m
+        self._max_depth_m = max_depth_m
+        self._depth_stale = depth_stale
+        self._quality = quality
+
+        # Eagerly encode AI view (primary stream requested by web clients)
+        ok, jpeg = cv2.imencode(".jpg", display_frame, [cv2.IMWRITE_JPEG_QUALITY, quality])
+        if not ok:
+            raise RuntimeError("Could not encode ai view as JPEG")
+        super().__setitem__("ai", jpeg.tobytes())
+
+    def __getitem__(self, key: str) -> bytes:
+        if super().__contains__(key):
+            return super().__getitem__(key)
+        if key == "camera":
+            ok, jpeg = cv2.imencode(".jpg", self._raw, [cv2.IMWRITE_JPEG_QUALITY, self._quality])
+            if not ok:
+                raise RuntimeError("Could not encode camera view as JPEG")
+            b = jpeg.tobytes()
+            super().__setitem__("camera", b)
+            return b
+        elif key == "depth":
+            depth_frame = render_depth_view(
+                self._raw, self._depth_map, self._detections,
+                self._min_depth_m, self._max_depth_m,
+                stale=self._depth_stale,
+            )
+            ok, jpeg = cv2.imencode(".jpg", depth_frame, [cv2.IMWRITE_JPEG_QUALITY, self._quality])
+            if not ok:
+                raise RuntimeError("Could not encode depth view as JPEG")
+            b = jpeg.tobytes()
+            super().__setitem__("depth", b)
+            return b
+        raise KeyError(key)
+
+    def get(self, key: str, default: Any = None) -> Any:
+        try:
+            return self[key]
+        except KeyError:
+            return default
+
+    def __iter__(self):
+        return iter(["camera", "ai", "depth"])
+
+    def __len__(self):
+        return 3
+
+    def __contains__(self, key: object) -> bool:
+        return key in ("camera", "ai", "depth")
+
+    def items(self):
+        return [("camera", self["camera"]), ("ai", self["ai"]), ("depth", self["depth"])]
+
+    def keys(self):
+        return ["camera", "ai", "depth"]
+
+    def values(self):
+        return [self["camera"], self["ai"], self["depth"]]
+
+
 class CameraPipeline:
     """One worker owns one source and one instance of each model."""
     def __init__(self, settings: dict[str, Any], zone_path: Path, distance_calibration_path: Path | None = None):
@@ -316,8 +387,6 @@ class CameraPipeline:
         self.thread: threading.Thread | None = None
         self.source: VideoSource | None = None
         self.latest_jpeg: bytes | None = None
-        self.latest_clean_jpeg: bytes | None = None
-        self.latest_depth_jpeg: bytes | None = None
         self.latest_views: dict[str, bytes | None] = {"camera": None, "ai": None, "depth": None}
         self.recent_frame_views: OrderedDict[int, dict[str, bytes]] = OrderedDict()
         self.latest_frame: np.ndarray | None = None
@@ -346,6 +415,42 @@ class CameraPipeline:
         self.warning = WarningMachine(float(settings.get("warning_distance_m", 4)), float(settings.get("critical_distance_m", 3)), hysteresis_m=0)
         self.frame_id = 0
         self.device = "unknown"
+        self._depth_request_event = threading.Event()
+        self._depth_input_lock = threading.Lock()
+        self._pending_depth_frame: np.ndarray | None = None
+        self._pending_depth_observed: float | None = None
+        self._pending_depth_frame_id: int | None = None
+        self._pending_depth_size: int = int(settings.get("depth_size", 518))
+        self._depth_output_lock = threading.Lock()
+        self._cached_depth: np.ndarray | None = None
+        self._cached_depth_at: float | None = None
+        self._cached_depth_reference_frame: np.ndarray | None = None
+        self._cached_depth_frame_id: int | None = None
+        self._cached_depth_people: list[dict[str, Any]] = []
+        self._depth_thread: threading.Thread | None = None
+        self._fps_history: list[float] = []
+        self._latest_clean_jpeg: bytes | None = None
+        self._latest_depth_jpeg: bytes | None = None
+
+    @property
+    def latest_clean_jpeg(self) -> bytes | None:
+        if self._latest_clean_jpeg is not None:
+            return self._latest_clean_jpeg
+        return self.latest_views.get("camera") if self.latest_views else None
+
+    @latest_clean_jpeg.setter
+    def latest_clean_jpeg(self, val: bytes | None) -> None:
+        self._latest_clean_jpeg = val
+
+    @property
+    def latest_depth_jpeg(self) -> bytes | None:
+        if self._latest_depth_jpeg is not None:
+            return self._latest_depth_jpeg
+        return self.latest_views.get("depth") if self.latest_views else None
+
+    @latest_depth_jpeg.setter
+    def latest_depth_jpeg(self, val: bytes | None) -> None:
+        self._latest_depth_jpeg = val
 
     def start(self) -> None:
         with self.lock:
@@ -399,6 +504,11 @@ class CameraPipeline:
             self.depth_filters.clear()
             self.last_valid_depth_by_id.clear()
             self.motion.clear()
+            with self._depth_output_lock:
+                self._cached_depth = None
+                self._cached_depth_at = None
+                self._cached_depth_reference_frame = None
+                self._cached_depth_frame_id = None
             self.latest_depth_map = None
             self.latest_depth_reference_frame = None
             self.latest_depth_frame_id = None
@@ -422,18 +532,11 @@ class CameraPipeline:
                  status: dict[str, Any], depth_map: np.ndarray | None = None,
                  depth_reference_frame: np.ndarray | None = None, depth_frame_id: int | None = None,
                  depth_reference_people: list[dict[str, Any]] | None = None) -> None:
-        depth_frame = render_depth_view(
-            raw_frame, depth_map, detections,
+        encoded = LazyViewDict(
+            raw_frame, display_frame, depth_map, detections,
             float(self.settings.get("min_depth_m", .1)), float(self.settings.get("max_depth_m", 20)),
-            stale=bool(status.get("depth_stale")),
+            bool(status.get("depth_stale")),
         )
-        images = {"camera": raw_frame, "ai": display_frame, "depth": depth_frame}
-        encoded: dict[str, bytes] = {}
-        for view_name, image in images.items():
-            ok, jpeg = cv2.imencode(".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, 85])
-            if not ok:
-                raise RuntimeError(f"Could not encode {view_name} view as JPEG")
-            encoded[view_name] = jpeg.tobytes()
         with self.lock:
             now_monotonic = time.monotonic()
             if now_monotonic - self._last_snapshot_expiry >= 1.0:
@@ -447,8 +550,8 @@ class CameraPipeline:
             self.latest_depth_reference_people = [dict(p) for p in depth_reference_people or []]
             self.latest_views = encoded
             self.latest_jpeg = encoded["ai"]
-            self.latest_clean_jpeg = encoded["camera"]
-            self.latest_depth_jpeg = encoded["depth"]
+            self._latest_clean_jpeg = None
+            self._latest_depth_jpeg = None
             frame_id = int(status["frame_id"])
             self.recent_frame_views[frame_id] = encoded
             while len(self.recent_frame_views) > RECENT_FRAME_BUFFER_SIZE:
@@ -458,6 +561,33 @@ class CameraPipeline:
             self.latest_detections = detections
             status["available_views"] = list(encoded)
             self.status = status
+
+    def _depth_worker(self, depth: DepthEstimator) -> None:
+        depth_interval_s = float(self.settings.get("depth_interval_s", 0.8))
+        while not self.stop_event.is_set():
+            if not self._depth_request_event.wait(timeout=0.05):
+                continue
+            self._depth_request_event.clear()
+            with self._depth_input_lock:
+                req_frame = self._pending_depth_frame
+                req_observed = self._pending_depth_observed
+                req_frame_id = self._pending_depth_frame_id
+                req_size = self._pending_depth_size
+                self._pending_depth_frame = None
+            if req_frame is None or self.stop_event.is_set():
+                continue
+            try:
+                if depth.size != req_size:
+                    depth.size = req_size
+                depth_map = depth.infer(req_frame)
+                with self._depth_output_lock:
+                    self._cached_depth = depth_map
+                    self._cached_depth_at = req_observed
+                    self._cached_depth_reference_frame = req_frame
+                    self._cached_depth_frame_id = req_frame_id
+            except Exception as exc:
+                LOG.warning("Asynchronous depth inference failed: %s", exc)
+            time.sleep(depth_interval_s)
 
     def view_snapshot(self, view: str, frame_id: int | None = None) -> tuple[bytes | None, dict[str, Any]]:
         with self.lock:
@@ -506,6 +636,9 @@ class CameraPipeline:
                 model_messages.append(f"Depth unavailable: {exc}")
                 LOG.warning(model_messages[-1])
             self.status.update(model="ready" if yolo else "partial", device=self.device, message="; ".join(model_messages) or None)
+            if depth is not None:
+                self._depth_thread = threading.Thread(target=self._depth_worker, args=(depth,), name="forklift-depth-worker", daemon=True)
+                self._depth_thread.start()
             cached_depth = None
             cached_depth_at = None
             cached_depth_reference_frame = None
@@ -513,6 +646,9 @@ class CameraPipeline:
             cached_depth_people: list[dict[str, Any]] = []
             started = time.monotonic()
             zones_checked_size: tuple[int, int] | None = None
+            zone_layer: np.ndarray | None = None
+            zone_mask_bool: np.ndarray | None = None
+            tracker_name = str(self.settings.get("tracker", "bytetrack.yaml"))
             while not self.stop_event.is_set():
                 frame, _, observed = source.read()
                 if frame is None:
@@ -542,11 +678,21 @@ class CameraPipeline:
                 if zones_checked_size != (frame_width, frame_height):
                     zones_checked_size = (frame_width, frame_height)
                     self.zones = None
+                    zone_layer = None
+                    zone_mask_bool = None
                     if self.zone_path.is_file():
                         try:
                             self.zones = load_zone_json(self.zone_path, (frame_width, frame_height))
                             types = sorted({z["name"] for z in self.zones["zones"]})
                             self.status.update(zone_status="loaded", zone_message="Kalibrasi dimuat", zone_types=types)
+                            zone_layer = np.zeros((frame_height, frame_width, 3), np.uint8)
+                            zone_mask = np.zeros((frame_height, frame_width), np.uint8)
+                            colors = {"hazard": (0, 0, 255), "warning": (0, 255, 255), "safe": (0, 255, 0)}
+                            for zone in self.zones["zones"]:
+                                pts = np.asarray(zone["points"], np.int32)
+                                cv2.fillPoly(zone_layer, [pts], colors[zone["name"]])
+                                cv2.fillPoly(zone_mask, [pts], 255)
+                            zone_mask_bool = zone_mask > 0
                         except ResolutionMismatchError as exc:
                             self.zones = None
                             self.status.update(zone_status="resolution_mismatch", zone_message=str(exc), zone_types=[])
@@ -602,7 +748,18 @@ class CameraPipeline:
                             self.distance_calibration_message = "Recalibrate distance for this AI resolution"
                     if depth is not None and depth.size != depth_size:
                         force_depth_inference = True
+                with self._depth_output_lock:
+                    if self._cached_depth is not None:
+                        cached_depth = self._cached_depth
+                        cached_depth_at = self._cached_depth_at
+                        cached_depth_reference_frame = self._cached_depth_reference_frame
+                        cached_depth_frame_id = self._cached_depth_frame_id
+
                 if force_depth_inference:
+                    with self._depth_output_lock:
+                        self._cached_depth = self._cached_depth_at = None
+                        self._cached_depth_reference_frame = None
+                        self._cached_depth_frame_id = None
                     cached_depth = cached_depth_at = None
                     cached_depth_reference_frame = None
                     cached_depth_frame_id = None
@@ -610,15 +767,15 @@ class CameraPipeline:
                     self.depth_filters.clear()
                     self.last_valid_depth_by_id.clear()
                     self.motion.clear()
-                if depth is not None and depth.size != depth_size:
-                    depth.size = depth_size
-                if depth is not None and (force_depth_inference or self.frame_id == 1 or (self.frame_id - 1) % int(self.settings.get("depth_every", 3)) == 0):
-                    cached_depth = depth.infer(frame)
-                    cached_depth_at = observed
-                    cached_depth_reference_frame = frame.copy()
-                    cached_depth_frame_id = self.frame_id
-                    cached_depth_people = []
-                result = yolo.track(frame, persist=True, tracker="botsort.yaml", classes=[0], conf=float(self.settings.get("confidence", 0.35)), imgsz=yolo_size, device=self.device, verbose=False)[0] if yolo is not None else None
+
+                if depth is not None and not self._depth_request_event.is_set():
+                    with self._depth_input_lock:
+                        self._pending_depth_frame = frame.copy()
+                        self._pending_depth_observed = observed
+                        self._pending_depth_frame_id = self.frame_id
+                        self._pending_depth_size = depth_size
+                        self._depth_request_event.set()
+                result = yolo.track(frame, persist=True, tracker=tracker_name, classes=[0], conf=float(self.settings.get("confidence", 0.35)), imgsz=yolo_size, device=self.device, verbose=False)[0] if yolo is not None else None
                 annotated = frame.copy()
                 people: list[dict[str, Any]] = []
                 stale = data_is_stale(cached_depth_at, observed, float(self.settings.get("max_depth_age_s", 1)))
@@ -685,17 +842,20 @@ class CameraPipeline:
                 elapsed_ms = (time.perf_counter() - tick) * 1000
                 stale_frame = (time.monotonic() - (observed or time.monotonic())) > 5
                 state = "DEGRADED" if stale or stale_frame or elapsed_ms > float(self.settings.get("latency_limit_ms", 1500)) or yolo is None or depth is None else "running"
-                if self.zones and self.zones.get("frame_size") == {"width": frame_width, "height": frame_height}:
-                    layer = annotated.copy()
-                    mask = np.zeros((frame_height, frame_width), np.uint8)
-                    colors = {"hazard": (0, 0, 255), "warning": (0, 255, 255), "safe": (0, 255, 0)}
-                    for zone in self.zones["zones"]:
-                        pts = np.asarray(zone["points"], np.int32)
-                        cv2.fillPoly(layer, [pts], colors[zone["name"]]); cv2.fillPoly(mask, [pts], 255)
-                    blended = cv2.addWeighted(annotated, .7, layer, .3, 0)
-                    annotated[mask > 0] = blended[mask > 0]
+                if zone_mask_bool is not None and zone_layer is not None:
+                    blended = cv2.addWeighted(annotated, .7, zone_layer, .3, 0)
+                    annotated[zone_mask_bool] = blended[zone_mask_bool]
                 model_message = "; ".join(model_messages) or ("Depth measurement is stale" if stale else None)
-                status = {"camera": "connected", "model": "ready" if yolo is not None and depth is not None else "partial", "detector_status": "ready" if yolo is not None else "unavailable", "depth_model_status": "ready" if depth is not None else "unavailable", "model_message": "; ".join(model_messages) or None, "device": self.device, "state": state, "error": None, "fps": self.frame_id / max(time.monotonic() - started, .001), "latency_ms": round(elapsed_ms, 1), "depth_stale": stale, "depth_age_s": depth_age_s, "max_depth_age_s": float(self.settings.get("max_depth_age_s", 1)), "frame_size": {"width": frame_width, "height": frame_height}, "frame_id": self.frame_id, "message": model_message,
+                now_mono = time.monotonic()
+                self._fps_history.append(now_mono)
+                if len(self._fps_history) > 30:
+                    self._fps_history.pop(0)
+                if len(self._fps_history) > 1:
+                    dt = self._fps_history[-1] - self._fps_history[0]
+                    current_fps = (len(self._fps_history) - 1) / dt if dt > 0 else 0.0
+                else:
+                    current_fps = self.frame_id / max(now_mono - started, 0.001)
+                status = {"camera": "connected", "model": "ready" if yolo is not None and depth is not None else "partial", "detector_status": "ready" if yolo is not None else "unavailable", "depth_model_status": "ready" if depth is not None else "unavailable", "model_message": "; ".join(model_messages) or None, "device": self.device, "state": state, "error": None, "fps": round(current_fps, 1), "latency_ms": round(elapsed_ms, 1), "depth_stale": stale, "depth_age_s": depth_age_s, "max_depth_age_s": float(self.settings.get("max_depth_age_s", 1)), "frame_size": {"width": frame_width, "height": frame_height}, "frame_id": self.frame_id, "message": model_message,
                           "zone_status": self.status.get("zone_status", "not_available"), "zone_message": self.status.get("zone_message", "Kalibrasi belum tersedia"), "zone_types": self.status.get("zone_types", [])}
                 status["distance_calibration_status"] = self.distance_calibration_status
                 status["distance_calibration_message"] = self.distance_calibration_message
@@ -713,6 +873,9 @@ class CameraPipeline:
                 self.recent_frame_views.clear()
                 self.updated_at = None
         finally:
+            self._depth_request_event.set()
+            if self._depth_thread and self._depth_thread.is_alive():
+                self._depth_thread.join(timeout=1.0)
             if source is not None:
                 self._close_source(source)
             self.source = None
@@ -936,6 +1099,9 @@ class CameraPipeline:
 
     def shutdown(self, timeout: float = 5.0) -> bool:
         self.stop_event.set()
+        self._depth_request_event.set()
+        if self._depth_thread and self._depth_thread.is_alive():
+            self._depth_thread.join(timeout=1.0)
         if self.source:
             self._close_source(self.source)
         if self.thread and self.thread.ident is not None:
@@ -1611,6 +1777,7 @@ PAGE = r'''<!doctype html>
         }finally{
           updateInProgress=false;
           if(refreshQueued){refreshQueued=false;update();}
+          else if(!document.hidden){setTimeout(update,30);}
         }
       }
       update();pollTimer=setInterval(update,1000);
