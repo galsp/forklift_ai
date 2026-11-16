@@ -1,0 +1,22 @@
+# Requirements khusus Jetson Orin (JetPack 6.0 / L4T R36.3, Ubuntu 22.04, Python 3.10)
+#
+# PENTING:
+# 1. Virtual environment HARUS dibuat dengan flag:
+#    python3 -m venv --system-site-packages .venv
+# 2. PyTorch (2.1.0 CUDA), Torchvision, TensorRT, dan OpenCV (GStreamer: YES)
+#    diwarisi langsung dari NVIDIA JetPack system packages.
+# 3. JANGAN menginstal wheel opencv-python dari PyPI agar GStreamer tetap aktif.
+# 4. Batasi numpy < 2.0.0 agar kompatibel dengan PyTorch 2.1.0 build JetPack.
+
+numpy<2.0.0
+flask>=3.0.0
+ultralytics>=8.3.0
+lapx>=0.13.0
+scipy>=1.10.0
+matplotlib>=3.3.0
+pandas>=2.0.0
+pyyaml>=6.0
+pillow>=9.0
+psutil>=5.8.0
+tqdm>=4.64.0
+ultralytics-thop>=2.2.0

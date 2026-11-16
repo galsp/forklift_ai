@@ -1,7 +1,7 @@
 {
   "source": "rtsp://admin:whattheFlux@172.22.22.11:554/cam/realmonitor?channel=1&subtype=0",
   "device": "auto",
-  "yolo_model": "models/yolo26n.pt",
+  "yolo_model": "models/yolo11n.pt",
   "depth_model": "indoor",
   "depth_checkpoint": "models/depth_anything_v2_metric_hypersim_vits.pth",
   "depth_source": "third_party/Depth-Anything-V2/metric_depth",
