@@ -1,0 +1,38 @@
+{
+  "format": "forklift-vision-pixel-zones",
+  "version": 1,
+  "frame_size": {
+    "width": 1280,
+    "height": 960
+  },
+  "source": "rtsp://admin:***@172.22.22.11:554/cam/realmonitor?channel=1&subtype=0",
+  "created_at": "2026-11-15T10:15:40.754642+00:00",
+  "zones": [
+    {
+      "name": "hazard",
+      "color": "#FF0000",
+      "points": [
+        [
+          90,
+          522
+        ],
+        [
+          664,
+          670
+        ],
+        [
+          684,
+          939
+        ],
+        [
+          8,
+          956
+        ],
+        [
+          4,
+          588
+        ]
+      ]
+    }
+  ]
+}

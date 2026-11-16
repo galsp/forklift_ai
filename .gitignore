@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+models/*.pt
+models/*.pth
+third_party/Depth-Anything-V2/
+outputs/recordings/*
+outputs/logs/*
+!outputs/recordings/.gitkeep
+!outputs/logs/.gitkeep
+floor_calibration.json
+floor_calibration_*.json
+calibration/web_settings.json
+*.mp4
+*.avi

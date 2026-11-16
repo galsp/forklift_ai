@@ -1,0 +1,5 @@
+- Prefers implementations to use verified, official library APIs and to clearly distinguish tested behavior from assumptions or unverified platform compatibility. Confidence: 0.95
+- Prefers a staged development workflow: validate algorithms and tests on a laptop before targeting edge hardware, and report actual test results and limitations without unsupported performance or accuracy claims. Confidence: 0.95
+- Wants the existing project left untouched until they finish tuning it; afterward, they want it re-analyzed and necessary fixes made. Confidence: 0.98
+- Prefers camera-zone calibration to be handled by a separate Python utility that uses a captured frame and its detections to define danger, caution, and safe zones. Confidence: 0.9
+- Prefers audits to be read-only, code-specific, and explicit about whether tests were actually run; findings should identify concrete defects rather than infer correctness from the presence of tests. Confidence: 0.9
